@@ -14,9 +14,8 @@ from dploot.triage.masterkeys import MasterkeysTriage, Masterkey
 from donpapi.lib.logger import DonPAPIAdapter
 from donpapi.lib.paths import DPP_LOOT_DIR_NAME
 
-
 class DonPAPICore:
-    def __init__(self, options: argparse.Namespace, db: Database, target: str, collectors: List, pvkbytes: bytes, plaintexts: Dict[str,str], nthashes: Dict[str,str], masterkeys: List[Masterkey], donpapi_config: DonPAPIConfig, output_dir:str) -> None:
+    def __init__(self, options: argparse.Namespace, db: Database, target: str, collectors: List, pvkbytes: bytes, plaintexts: Dict[str,str], nthashes: Dict[str,str], masterkeys: List[Masterkey], donpapi_config: DonPAPIConfig, false_positive: list, max_filesize: int, output_dir:str) -> None:
         self.options = options
         self.db = db
         self.host = target
@@ -30,8 +29,12 @@ class DonPAPICore:
         self.share = DEFAULT_CUSTOM_SHARE
         self.remoteops_allowed = not options.no_remoteops
         
-        self.output_dir = os.path.join(output_dir,DPP_LOOT_DIR_NAME,self.host)
-        os.makedirs(self.output_dir, exist_ok=True)
+        self.global_output_dir = os.path.join(output_dir, DPP_LOOT_DIR_NAME)
+        self.target_output_dir = os.path.join(output_dir, DPP_LOOT_DIR_NAME, self.host)
+        os.makedirs(self.target_output_dir, exist_ok=True)
+        
+        self.false_positive = false_positive
+        self.max_filesize = max_filesize
         
         self.dploot_conn = None
         self.dpp_remoteops = None
@@ -54,7 +57,9 @@ class DonPAPICore:
             aesKey=options.aesKey,
             use_kcache=options.k,
         )
+        
         self.logger = DonPAPIAdapter()
+        res = self.init_connection()
         if not self.init_connection():
             return
         if self.options.laps:
@@ -83,6 +88,7 @@ class DonPAPICore:
 
         self.host = self.dploot_conn.smb_session.getRemoteHost()
         self.hostname = self.dploot_conn.smb_session.getServerName()
+        
         self.db.add_computer(
             ip=self.host,
             hostname=self.hostname,
@@ -104,7 +110,7 @@ class DonPAPICore:
     def init_connection(self):
         self.dploot_conn = DPLootSMBConnection(self.dploot_target)
         if self.dploot_conn.connect() is None:
-            self.logger.debug("Could not connect to %s" % self.dploot_target.address)
+            self.logger.debug(f"Could not connect to {self.dploot_target.address}")
             return False
         return True
     
@@ -264,11 +270,10 @@ class DonPAPICore:
             # Dump SAM
             self.logger.display("Dumping SAM")
             self.dump_sam()
-            if self.sam_dump.items_found:
+            if hasattr(self.sam_dump, 'items_found') and self.sam_dump.items_found is not None:
                 self.logger.secret(f"Got {len(self.sam_dump.items_found)} accounts", "SAM")
             else:
                 self.logger.fail(f"No account found in SAM (maybe blocked by EDR)")
-            
             # Dump LSA
             self.logger.display("Dumping LSA")
             self.dump_lsa()
@@ -298,7 +303,16 @@ class DonPAPICore:
 
         for collector in self.collectors:
             try:
-                collector(self.dploot_target, self.dploot_conn, self.masterkeys, self.options, self.logger, self).run()
+                collector(
+                    self.dploot_target, 
+                    self.dploot_conn, 
+                    self.masterkeys, 
+                    self.options, 
+                    self.logger, 
+                    self, 
+                    self.false_positive, 
+                    self.max_filesize
+                ).run()
             except Exception as e:
                 self.logger.fail(f"Error during {collector.__name__}: {e}")
 
@@ -318,7 +332,7 @@ class DonPAPICore:
             return self._users
         
         users = list()
-        false_positive = ['.','..', 'desktop.ini','Public','Default','Default User','All Users']
+        false_positive = [".", "..", "desktop.ini", "Public", "Default", "Default User", "All Users"]
         users_dir_path = 'Users\\*'
         directories = self.dploot_conn.listPath(shareName=self.share, path=ntpath.normpath(users_dir_path))
         for d in directories:
